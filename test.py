@@ -1,85 +1,103 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jul  5 14:41:34 2022
-
 @author: mds19
 """
 
 # imports
 import torch
+from torch.optim import Adam
 import torch.utils.data
-from optparse import OptionParser
-import nibabel as nib
-import numpy as np
+from utils.dataloader import DataSetTrain, DataSetEval, get_transforms
 
-# internal imports 
-from model.network_3d import SpatialTransform
-from model.losses_3d import gradient
-from utils.dataloader import DataSetEval
+# internal imports
+from models.network_3d import unet_core
+from training.epoch_cycles import train_cycle, eval_cycle
+import numpy as np
+import os
+from argparse import ArgumentParser
+from torch.utils.tensorboard import SummaryWriter
+
+
+def get_args_from_command_line():
+    parser = ArgumentParser(description="Parser for training Sim Atrophy")
+    parser.add_argument("--region-list-path", dest="region_list_path", default="./region_list.npy")
+    parser.add_argument("--atr-path", dest="atr_folder", default="/data/ADNI_mariana/Train/")
+    parser.add_argument("--seg-path", dest="seg_folder", default="/data/ADNI_mariana/Seg_down/")
+    parser.add_argument("--parc-path", dest="parc_folder", default="/data/ADNI_mariana/Parcellations_down/")
+    parser.add_argument("--img-path", dest="img_folder", default="/data/ADNI_mariana/T1_down/")
+    parser.add_argument("--atr-is-list", dest="atr_list", default=True, action="store_true")
+    parser.add_argument("--n-dims", dest="n_dims", default=3, type=int)
+    parser.add_argument("--batch-size", dest="batch_size", default=32, type=int)
+    parser.add_argument("--gpu", default=0, type=int)
+    parser.add_argument("--amp", default=False, action="store_true")
+    parser.add_argument("--nf-enc", dest="nf_enc", default=[16, 32, 32, 32], type=int, nargs="+")
+    parser.add_argument("--nf-dec", dest="nf_dec", default=[32, 32, 32, 32, 8, 8], type=int, nargs="+")
+    parser.add_argument("--epochs", dest="epochs", default=200, type=int)
+    parser.add_argument("--n-save-epoch", dest="n_save_epoch", default=1, type=int)
+    parser.add_argument("--lr", dest="lr", default=1e-5, type=float)
+    parser.add_argument("--loss-1-weight", dest="w1", default=100, type=float)
+    parser.add_argument("--loss-2-weight", dest="w2", default=100, type=float)
+    parser.add_argument("--loss-3-weight", dest="w3", default=100, type=float)
+    parser.add_argument("--load-model", dest="load_model", default=None)
+    parser.add_argument("--save-folder", dest="save_folder", default="./results_folder")
+    parser.add_argument("--seed", dest="seed", default=42, type=int)
+    parser.add_argument("--shuffle", dest="shuffle", default=True, action="store_true")
+    parser.add_argument("--pin-memory", dest="pin_memory", default=True, action="store_true")
+    parser.add_argument("--num-workers", dest="num_workers", default=4, type=int)
+    parser.add_argument("--compile-model", dest="compile_model", default=True)
+    parser.add_argument("--log-dir", dest="log_dir", default="./results_folder/logs")
+    args = parser.parse_args()
+    return args
 
 
 def main():
-    # define args
-    parser = OptionParser()
-    parser.add_option("--atr_path", dest="atr_folder", default='/data/ADNI_mariana/Train/')
-    parser.add_option("--seg_path", dest="seg_folder", default='/data/ADNI_mariana/Seg_down/')
-    parser.add_option("--parc_path", dest="parc_folder", default='/data/ADNI_mariana/Parcellations_down/')
-    parser.add_option("--img_path", dest="img_folder", default='/data/ADNI_mariana/T1_down/')
-    parser.add_option("--atr_is_list", dest="atr_list", default=False)
-    parser.add_option("--batch_n", dest="batch_size", default=1)
-    parser.add_option("--gpu", dest='gpu', default=0)
-    parser.add_option("--load_model", dest='load_model', default='model_bio199.pt')
+    opts = get_args_from_command_line()
 
-    (opts, args) = parser.parse_args()
+    if opts.seed is not None:
+        torch.manual_seed(int(opts.seed))
 
-    device = torch.device('cuda:' + str(opts.gpu) if torch.cuda.is_available() else 'cpu')
+    if opts.gpu is not None:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.autograd.profiler.profile(enabled=False)
 
-    # load data
-    ds_test = DataSetEval(atr_folder=opts.atr_folder, img_folder=opts.img_folder, parc_folder=opts.parc_folder, atr_list = True)
-    test_loader = torch.utils.data.DataLoader(ds_test, batch_size=opts.batch_size, shuffle=False)
+    device = torch.device("cuda:" + str(opts.gpu) if torch.cuda.is_available() else "cpu")
 
-    model = torch.load(opts.load_model, map_location=device)
+    test_transforms = get_transforms(mode="val")
 
-    model.eval()
-    for k, (input_image, input_atrophy, affine, sub_id, original_size) in enumerate(test_loader, 0):
-        if input_atrophy.max() > 2:
-          break
-        deformation = model(atr1.to(device))
+    # TODO: check how the train and eval datasets are created and make it one function, specifying the train/val/test mode
+    ds_test = DataSetEval(
+        region_list_path=opts.region_list_path,
+        atr_folder=opts.atr_folder,
+        seg_folder=opts.seg_folder,
+        parc_folder=opts.parc_folder,
+        atr_list=opts.atr_list,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        ds_test,
+        batch_size=opts.batch_size,
+        shuffle=False,
+        pin_memory=opts.pin_memory,
+        num_workers=opts.num_workers,
+    )
 
-        # ATTENTION!!!
-        # this is needed to fix a mismatch between the order of the axis defined in the biomechanical model
-        # and the axis on the image. TO BE FIXED IN A FUTURE RELEASE       
-        new_flow = torch.ones_like(deformation)
-        new_flow[:, 0, :, :, :] = deformation[:, 2, :, :, :]
-        new_flow[:, 1, :, :, :] = deformation[:, 0, :, :, :]
-        new_flow[:, 2, :, :, :] = deformation[:, 1, :, :, :]
+    # TODO: write a description of input parameters, especially n_in
+    model = unet_core(dim=opts.n_dim, enc_df=opts.nf_enc, dec_nf=opts.nf_dec, n_in=1)
 
-        spatial_transform = SpatialTransform([input_image.shape[2], input_image.shape[3], input_image.shape[4]]).to(
-            device)
+    assert os.path.exists(opts.load_model), "Model file not found"
+    model = torch.load(opts.load_model, map_location="cpu").to(device)
+    
+    if opts.compile_model:
+        model = torch.compile(model)
 
-        deformed_image_2 = spatial_transform(deformed_image_1.to(device), new_flow)
+    if not os.path.exists(opts.save_folder):
+        os.makedirs(opts.save_folder)
 
-        # save deformed image and flow with original image size
-        final_image = np.zeros((182, 218, 182))
-        final_image[2:178, 4:212, 2:178] = deformed_image.detach().cpu().numpy().squeeze(0).squeeze(0)
 
-        flow_final = np.zeros((182, 218, 182, 3))
-        flow_final[2:178, 4:212, 2:178, :] = new_flow.permute(0, 2, 3, 4, 1).detach().cpu().numpy().squeeze(0)
-
-        # get det(F), which corresponds to computed atrophy
-        F = gradient(deformation, device)
-        F[:, :, :, :, 0, 0] = F[:, :, :, :, 0, 0] + 1
-        F[:, :, :, :, 1, 1] = F[:, :, :, :, 1, 1] + 1
-        F[:, :, :, :, 2, 2] = F[:, :, :, :, 2, 2] + 1
-        det = torch.det(F).detach().cpu().numpy().squeeze(0)
-
-        nib.save(nib.Nifti1Image(final_image, affine=affine.squeeze(0)),
-                 'results/' + sub_id[0].split('.')[0].split('_to')[0] + '_deformed_img.nii.gz')
-        nib.save(nib.Nifti1Image(flow_final, affine=affine.squeeze(0)),
-                 'results/' + sub_id[0].split('.')[0].split('_to')[0] + '_deformation.nii.gz')
-        nib.save(nib.Nifti1Image(det, affine=affine.squeeze(0)),
-                 'results/' + sub_id[0].split('.')[0].split('_to')[0] + '_estimated_atrophy.nii.gz')
+    test_loss, test_loss1, test_loss2, test_loss3 = eval_cycle(opts, model, test_loader, test_transforms, device)
+    print(f"Total Test Loss: {test_loss}, Test Loss 1: {test_loss1}, Test Loss 2: {test_loss2}, Test Loss 3: {test_loss3}")
 
     return
 
